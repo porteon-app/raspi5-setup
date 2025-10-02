@@ -15,6 +15,9 @@ You’re hitting Permission denied (publickey) because you’re trying to copy a
 Do this:
 
 1) Use the correct user (and your key)
+scp -i ~/.ssh/id_ed25519 \
+"/Users/frederic/Documents/Porteon/app_code_testing/Pi_boot_universal/setup_adsb.sh" \
+lsgs@LSGS-02.local:~/setup_adsb.sh
 
 scp -i ~/.ssh/id_ed25519 setup_adsb_v1-2.sh lsgs@lsgs-02.local:~
 
