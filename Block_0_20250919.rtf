@@ -1,0 +1,190 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2822
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fnil\fcharset0 .AppleSystemUIFontMonospaced-Regular;\f1\fnil\fcharset0 Menlo-Regular;\f2\fswiss\fcharset0 Helvetica;
+\f3\fnil\fcharset0 .SFNS-Regular;\f4\fnil\fcharset0 HelveticaNeue-Bold;}
+{\colortbl;\red255\green255\blue255;\red0\green0\blue0;\red155\green162\blue177;\red136\green185\blue102;
+\red74\green80\blue93;\red197\green136\blue83;\red184\green93\blue213;\red81\green156\blue233;\red14\green14\blue14;
+}
+{\*\expandedcolortbl;;\csgray\c0;\cssrgb\c67059\c69804\c74902;\cssrgb\c59608\c76471\c47451;
+\cssrgb\c36078\c38824\c43922;\cssrgb\c81961\c60392\c40000;\cssrgb\c77647\c47059\c86667;\cssrgb\c38039\c68235\c93333;\cssrgb\c6700\c6700\c6700;
+}
+\margl1440\margr1440\vieww14060\viewh16100\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 #while setting up pi image use \
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+
+\f1\fs22 \cf2 \CocoaLigature0 cat ~/.ssh/id_ed25519.pub | pbcopy\
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+
+\f0\fs26 \cf3 \CocoaLigature1 cat ~/.ssh/id_ed25519.pub
+\f1\fs22 \cf2 \CocoaLigature0 \
+#to get the key and past it in pi image.\
+\
+This is the key pair for raspberry image:\
+\
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHoKvG3we58Fw0/ZIUjAhrE6K+CuaccndCMIfthhr65L frederic@Frederics-MacBook-Air.local
+\f0\fs24 \cf0 \CocoaLigature1 \
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+\cf0 \
+#connect with pi\
+ssh-keygen -R lsgs-01.local\
+ssh -i ~/.ssh/id_ed25519 lsgs@lsgs-01.local\
+\
+\
+\
+# Run block_1\
+#paste the entire block\
+#run:\
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f2 \cf0 # Install/repair agent\
+curl -L https://downloads.remote.it/remoteit/install_agent.sh | sudo bash\
+\
+# If you have a registration code, use it (replace with your real code)\
+R3_REGISTRATION_CODE="
+\f0\fs26 \cf4 D2FFA17F-9743-58CD-A98E-E6564372F33F
+\f2\fs24 \cf0 " sh -c "$(curl -L https://downloads.remote.it/remoteit/install_agent.sh)" ssh -c "$(curl -L https://downloads.remote.it/remoteit/install_agent.sh)"\
+\
+# Sanity checks\
+remoteit --version || true\
+systemctl status remoteit || systemctl status remoteit-agent || true\
+remoteit list || true\
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+
+\f0\fs26 \cf3 sudo bash /tmp/bootstrap_pi.sh \cf4 \'93D2FFA17F-9743-58CD-A98E-E6564372F33F\'94\cf3  --hostname=LSGS-01\
+\
+#Run block-2 (if needed check which USB port is in use usually 2)\
+# Install picocom and add your user to dialout (serial) group\
+sudo apt-get update\
+sudo apt-get install -y picocom\
+sudo usermod -aG dialout "$USER"\
+\
+# Optional: stable alias /dev/cellular for the LTE modem (adjust IDs if needed)\
+# First, find IDs:  lsusb  | grep -i -E 'quectel|fibocom|simcom|huawei'\
+# Then create a rule (example shows Quectel EC25, 2C7C:0125; change to yours):\
+echo 'SUBSYSTEM=="tty", ATTRS\{idVendor\}=="2c7c", ATTRS\{idProduct\}=="0125", SYMLINK+="cellular"' \\\
+| sudo tee /etc/udev/rules.d/99-cellular.rules >/dev/null\
+sudo udevadm control --reload-rules && sudo udevadm trigger\
+\
+# Discover serial ports as they appear\
+dmesg | egrep -i "ttyUSB|ttyACM"\
+# Typical modem AT port candidates: /dev/ttyUSB2 or /dev/ttyUSB3\
+\
+[[[# Open the modem AT port at 115200 baud\
+picocom -b 115200 /dev/ttyUSB2\
+# to exit picocom: ctrl+A then ctrl+X]]]\
+\
+#on the pi (bring the LTE connection on)\
+sudo lte-up\
+#check if working:\
+ping -c 2 1.1.1.1\
+curl -I https://google.com\
+\
+#Implement the remoteit service\
+export R3_REGISTRATION_CODE=\'93C07CB169-1378-5E32-BD17-8289E065E680\'94\
+curl -fsSL https://downloads.remote.it/remoteit/install_agent.sh | sudo -E bash\
+\
+#run now the Switch_command services\
+#then test\
+# Agent/service\
+systemctl status remoteit-refresh.service --no-pager\
+journalctl -u remoteit-refresh.service -n 50 --no-pager\
+\
+#if not connected to remoteit punch in:\
+echo -e "nameserver 1.1.1.1\\nnameserver 8.8.8.8" | sudo tee /etc/resolv.conf >/dev/null\
+ping -c 1 install.remote.it || true\
+curl -I https://install.remote.it || true\
+\
+# Retry the service now:\
+sudo systemctl restart remoteit-refresh.service\
+sleep 5\
+journalctl -u remoteit-refresh.service -n 50 --no-pager\
+\
+#then find the claim code:\
+# Does the registration file exist and have a key?\
+sudo sed -n '1,120p' /etc/remoteit/registration 2>/dev/null || echo "no /etc/remoteit/registration"\
+\
+# See what the refresh script would do (verbose)\
+sudo bash -x /usr/share/remoteit/refresh.sh boot | sed -n '1,120p'\
+\
+#copy the claim code and plug it in remoteit claim placeholder\
+\
+# Network still on LTE\
+ip route | head -1\
+curl -sS https://ifconfig.me\
+\
+#now you should be able to connect:\
+ssh -i ~/.ssh/id_ed25519 lsgs@127.0.0.1 -p 33000\
+\
+#this will connect with remote.it,\
+#in order to avoid searching or connecting with the right key, use this:\
+\cf5 # Append this to ~/.ssh/config\cf3 \
+\
+cat >> ~/.ssh/config <<\cf4 'EOF'\cf3 \
+\
+Host LSGS-01_remoteit\
+  HostName 127.0.0.1\
+  Port 33000\
+  User lsgs\
+  IdentityFile ~/.ssh/id_ed25519\
+  IdentitiesOnly yes\
+EOF\
+\
+#then you only need:\
+ssh LSGS-01_remoteit\
+\
+#create easy access to pi:\
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+\cf3 Host LSGS_01\
+  HostName LSGS_01-ssh.at.remote.it\
+  Port \cf6 33000\cf3 \
+  \cf7 User\cf3  \cf8 lsgs\cf3 \
+  IdentityFile ~/.ssh/id_ed25519\
+\
+Host LSGS_02\
+  HostName LSGS_02-ssh.at.remote.it\
+  Port \cf6 33000\cf3 \
+  \cf7 User\cf3  \cf8 lsgs\cf3 \
+  IdentityFile ~/.ssh/id_ed25519\
+\
+\
+#then connect using only:\
+ssh LSGS_01\
+ssh LSGS_02\
+\
+\
+#SWITCHING from wifi to LTE to remote.it to local\
+		\
+sudo switch-to-lte-safe 		\
+\
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+\cf3 sudo lte-up          \cf5 # defaults to wwan0\cf3 \
+ip route             \cf5 # confirm default via wwan0\
+\
+sudo lte-down\
+sudo wifi-down\
+\
+#to check if you are connected through wifi or LTE:\
+ip route | head -1\
+#if 
+\f3\fs28 \cf9 If it shows 
+\f0 default via 192.168.225.1 dev wwan0
+\f3  \uc0\u8594  you\'92re going out via 
+\f4\b LTE
+\f3\b0 .\
+\pard\tqr\tx100\tx260\li260\fi-260\sl324\slmult1\sb240\partightenfactor0
+\cf9 	\'95	If it shows 
+\f0 default via 172.20.10.1 dev wlan0
+\f3  (or your hotspot router IP) \uc0\u8594  you\'92re going out via 
+\f4\b Wi-Fi
+\f3\b0 .
+\f0\fs26 \cf5 \
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+\cf5 \
+\cf3 \
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+\cf3 \
+\
+\
+\
+}

@@ -1,0 +1,90 @@
+
+how to connect from computer and run the setup_adsb.sh file
+
+
+*************************************************************************************
+
+Option A — Copy from your Mac to the Pi (recommended)
+
+Run this on your Mac (not on the Pi):
+
+scp -i ~/.ssh/id_ed25519 /Users/frederic/Downloads/setup_adsb.sh lsgs@lsgs-01.local:~
+
+Then SSH to the Pi and run it:
+
+ssh -i ~/.ssh/id_ed25519 lsgs@lsgs-01.local
+chmod +x ~/setup_adsb.sh
+sudo ~/setup_adsb.sh
+
+# make the script executable
+chmod +x ~/setup_adsb.sh
+
+# run it with sudo, using the full path
+sudo /home/lsgs/setup_adsb.sh
+
+*************************************************************************************
+
+
+CHECK IF ALL SYSTEM ARE RUNNING
+
+sudo systemctl enable --now NetworkManager ModemManager systemd-resolved
+sudo systemctl enable --now dump1090-fa adsb-collector adsb-uploader
+sudo systemctl enable --now remoteit-health.timer net-failover.timer adsb-health.timer
+# remoteit-refresh is a oneshot hook; we call it from the bootstrap script.
+
+
+
+
+
+HOW DO YOU KNOW WHEN IT"S COMPLETED?
+
+When the script completes, it will display a message indicating that the setup is finished. You should see something like:Good question 👍.
+
+Since setup_adsb.sh is a regular shell script, you’ll know it’s running and when it has completed like this:
+
+⸻
+
+1. While it’s running
+	•	The script prints each command’s output in your terminal: package installs, systemctl enables, echo messages.
+	•	You’ll see scrolling text such as:
+
+[INFO] Installing dump1090-fa...
+[OK] ADS-B collector service installed
+
+
+	•	If it pauses for a while on apt-get install, that’s normal (downloading packages).
+
+⸻
+
+2. When it finishes
+	•	The script will stop printing and drop you back at the prompt:
+
+lsgs@LSGS-01:~ $
+
+
+	•	Often we add a final echo at the end of the script like:
+
+echo "[SETUP COMPLETE] Reboot the Pi now with: sudo reboot"
+
+If that’s in your version, you’ll see that as the last line.
+
+⸻
+
+3. Verify after completion
+
+To make sure everything is installed and enabled, run:
+
+# Check services
+systemctl status dump1090-fa adsb-collector adsb-uploader --no-pager
+
+# Check the bootstrap timer
+systemctl status adsb-online-bootstrap.timer --no-pager
+
+# Tail uploader log
+tail -n 20 ~/Documents/adsb/logs/uploader.log
+
+If you see those services active (running) and logs with “BOOTSTRAP tick” and S3 uploads, then the setup really finished properly.
+
+⸻
+
+👉 Do you want me to modify your setup_adsb.sh so that it always prints a big “SETUP COMPLETE” message at the end, so you’re never left wondering?

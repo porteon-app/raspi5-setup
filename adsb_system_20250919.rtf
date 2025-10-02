@@ -1,0 +1,257 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2822
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fnil\fcharset0 .AppleSystemUIFontMonospaced-Regular;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 #!/usr/bin/env bash\
+set -euo pipefail\
+\
+USER_NAME="$\{SUDO_USER:-$\{USER\}\}"\
+HOME_DIR="$(getent passwd "$USER_NAME" | cut -d: -f6)"\
+BASE_DIR="$\{HOME_DIR\}/Documents/adsb"\
+APP_DIR="$\{BASE_DIR\}/app"\
+PROC_DIR="$\{BASE_DIR\}/files/processing"\
+SEND_DIR="$\{BASE_DIR\}/files/sending"\
+LOG_DIR="$\{BASE_DIR\}/logs"\
+\
+S3_URI_PREFIX="s3://adsbcsvdata/adsb_hex_data/Europe/switzerland/lsgs/"\
+AWS_PROFILE="pi_lsgs_hex_s3"\
+AWS_REGION="us-east-2"\
+\
+sudo apt-get update\
+sudo apt-get install -y \\\
+  git build-essential pkg-config librtlsdr-dev rtl-sdr libncurses5-dev \\\
+  netcat-openbsd lighttpd\
+\
+# Avoid DVB kernel driver conflict with RTL-SDR\
+echo 'blacklist dvb_usb_rtl28xxu' | sudo tee /etc/modprobe.d/rtl-sdr-blacklist.conf >/dev/null || true\
+\
+# Create dirs\
+sudo -u "$USER_NAME" mkdir -p "$APP_DIR" "$PROC_DIR" "$SEND_DIR" "$LOG_DIR"\
+\
+### ===== Build/install dump1090-fa binary and service =====\
+# If binary not present, build from source (binary name is 'dump1090'); install as 'dump1090-fa'\
+if ! [ -x /usr/local/bin/dump1090-fa ]; then\
+  cd "$APP_DIR"\
+  [ -d dump1090-fa ] || sudo -u "$USER_NAME" git clone https://github.com/flightaware/dump1090.git dump1090-fa\
+  cd dump1090-fa\
+  make -j"$(nproc)"\
+  sudo install -m 0755 ./dump1090 /usr/local/bin/dump1090-fa\
+fi\
+\
+# Custom systemd service (robust & simple)\
+sudo tee /etc/systemd/system/dump1090-fa.service >/dev/null <<'EOF'\
+[Unit]\
+Description=dump1090 ADS-B receiver (custom service)\
+After=network-online.target\
+Wants=network-online.target\
+\
+[Service]\
+# Run as root to avoid SDR permission issues across distros; simplify rollout.\
+ExecStart=/usr/local/bin/dump1090-fa \\\
+  --device-index 0 --gain -10 --ppm 0 \\\
+  --net --net-ro-port 30002 --net-sbs-port 30003 --net-bo-port 30005 \\\
+  --write-json /run/dump1090-fa --json-location-accuracy 1\
+Restart=always\
+RestartSec=1\
+RuntimeDirectory=dump1090-fa\
+NoNewPrivileges=true\
+\
+[Install]\
+WantedBy=multi-user.target\
+EOF\
+\
+sudo systemctl daemon-reload\
+sudo systemctl enable dump1090-fa\
+sudo systemctl restart dump1090-fa\
+\
+### ===== Collector (two columns: HEX,TIMESTAMP_NS; .hex slices) =====\
+sudo tee "$\{APP_DIR\}/collector.py" >/dev/null <<'PY'\
+#!/usr/bin/env python3\
+import os, socket, time, pathlib\
+\
+BASE = pathlib.Path.home() / "Documents" / "adsb"\
+PROC_DIR = BASE / "files" / "processing"\
+SEND_DIR = BASE / "files" / "sending"\
+HOST, PORT = "127.0.0.1", 30002\
+LINES_LIMIT = 5000\
+TIME_SLICE_SEC = 3.0\
+\
+PROC_DIR.mkdir(parents=True, exist_ok=True)\
+SEND_DIR.mkdir(parents=True, exist_ok=True)\
+\
+HOSTNAME = os.uname().nodename\
+\
+def utc_ns() -> int:\
+    return int(time.time_ns())\
+\
+def new_tmp_path() -> pathlib.Path:\
+    ts_ms = int(time.time() * 1000)\
+    return PROC_DIR / f"hex_\{HOSTNAME\}_\{ts_ms\}.tmp"\
+\
+def finalize(tmp_path: pathlib.Path) -> pathlib.Path:\
+    final = SEND_DIR / tmp_path.name.replace(".tmp", ".hex")\
+    os.replace(tmp_path, final)\
+    return final\
+\
+def collect():\
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(10); s.connect((HOST, PORT))\
+    s_file = s.makefile("r", buffering=1, newline="\\n")\
+    buf_count = 0; slice_start = time.time()\
+    tmp = new_tmp_path(); f = open(tmp, "w", buffering=1)\
+    try:\
+        while True:\
+            line = s_file.readline()\
+            if not line:\
+                time.sleep(0.01); continue\
+            line = line.strip()\
+            if not (line.startswith("*") and line.endswith(";")):\
+                continue\
+            hexmsg = line[1:-1].upper()\
+            tns = utc_ns()\
+            f.write(f"\{hexmsg\},\{tns\}\\n")\
+            buf_count += 1\
+            if buf_count >= LINES_LIMIT or (time.time() - slice_start) >= TIME_SLICE_SEC:\
+                f.flush(); os.fsync(f.fileno()); f.close()\
+                finalize(tmp)\
+                buf_count = 0; slice_start = time.time()\
+                tmp = new_tmp_path(); f = open(tmp, "w", buffering=1)\
+    finally:\
+        try: f.close()\
+        except Exception: pass\
+        s.close()\
+\
+if __name__ == "__main__":\
+    collect()\
+PY\
+\
+### ===== Uploader (gzip, flat S3 prefix, date-in-filename, endpoint pinned, non-blocking) =====\
+sudo tee "$\{APP_DIR\}/uploader.py" >/dev/null <<PY\
+#!/usr/bin/env python3\
+import os, time, pathlib, subprocess\
+\
+BASE = pathlib.Path.home() / "Documents" / "adsb"\
+SEND_DIR = BASE / "files" / "sending"\
+S3_URI_PREFIX = "$\{S3_URI_PREFIX\}"\
+\
+SEND_DIR.mkdir(parents=True, exist_ok=True)\
+\
+def aws_cp(src_path: pathlib.Path, dest_uri: str) -> subprocess.CompletedProcess:\
+    return subprocess.run(\
+        ["aws","s3","cp",str(src_path),dest_uri,\
+         "--only-show-errors",\
+         "--region","$\{AWS_REGION\}",\
+         "--endpoint-url","https://s3.$\{AWS_REGION\}.amazonaws.com"],\
+        capture_output=True, text=True\
+    )\
+\
+def gzip_file(src: pathlib.Path) -> pathlib.Path:\
+    # hex_<HOST>_<ms>.hex -> hex_<HOST>_<YYYYMMDD>_<ms>.hex.gz\
+    parts = src.stem.split("_"); ms = parts[-1]\
+    try: day = time.strftime("%Y%m%d", time.gmtime(int(ms)/1000))\
+    except Exception: day = time.strftime("%Y%m%d", time.gmtime())\
+    head = "_".join(parts[:-1])\
+    gz = src.with_name(f"\{head\}_\{day\}_\{ms\}.hex.gz")\
+    with open(gz, "wb") as out:\
+        subprocess.run(["gzip","-c",str(src)], check=True, stdout=out)\
+    return gz\
+\
+def dest_uri(gz: pathlib.Path) -> str:\
+    return f"\{S3_URI_PREFIX\}\{gz.name\}"   # flat path, no date folders\
+\
+def upload_once(hex_path: pathlib.Path) -> bool:\
+    # ensure gz exists for this hex\
+    gz_path = hex_path.with_suffix(hex_path.suffix + ".gz")\
+    if not gz_path.exists():\
+        try: gz_path = gzip_file(hex_path)\
+        except Exception as e:\
+            print("GZIP_FAIL", hex_path.name, e); return False\
+    res = aws_cp(gz_path, dest_uri(gz_path))\
+    if res.returncode == 0:\
+        try: os.remove(gz_path)\
+        except FileNotFoundError: pass\
+        try: os.remove(hex_path)\
+        except FileNotFoundError: pass\
+        return True\
+    # One-shot attempt; leave for next loop\
+    if res.stderr: print("UPLOAD_FAIL", gz_path.name, res.stderr.strip())\
+    return False\
+\
+def main():\
+    backoff = 1.0\
+    while True:\
+        any_ok = False\
+        for p in sorted(SEND_DIR.glob("*.hex")):\
+            if upload_once(p): any_ok = True\
+        if any_ok:\
+            backoff = 1.0\
+        else:\
+            time.sleep(backoff)\
+            backoff = min(backoff * 2, 60)\
+\
+if __name__ == "__main__":\
+    main()\
+PY\
+\
+sudo chown -R "$USER_NAME:$USER_NAME" "$BASE_DIR"\
+sudo chmod +x "$\{APP_DIR\}/collector.py" "$\{APP_DIR\}/uploader.py"\
+\
+### ===== Systemd units for collector/uploader =====\
+sudo tee /etc/systemd/system/adsb-collector.service >/dev/null <<EOF\
+[Unit]\
+Description=ADS-B HEX collector (AVR->CSV slicer)\
+After=network-online.target dump1090-fa.service\
+Wants=network-online.target\
+\
+[Service]\
+User=$\{USER_NAME\}\
+Group=$\{USER_NAME\}\
+ExecStart=/usr/bin/env python3 /home/$\{USER_NAME\}/Documents/adsb/app/collector.py\
+Restart=always\
+RestartSec=1\
+StandardOutput=append:/home/$\{USER_NAME\}/Documents/adsb/logs/collector.log\
+StandardError=append:/home/$\{USER_NAME\}/Documents/adsb/logs/collector.err\
+NoNewPrivileges=true\
+\
+[Install]\
+WantedBy=multi-user.target\
+EOF\
+\
+sudo tee /etc/systemd/system/adsb-uploader.service >/dev/null <<EOF\
+[Unit]\
+Description=ADS-B HEX uploader (sending -> S3)\
+After=network-online.target\
+Wants=network-online.target\
+\
+[Service]\
+User=$\{USER_NAME\}\
+Group=$\{USER_NAME\}\
+Environment=AWS_PROFILE=$\{AWS_PROFILE\}\
+Environment=AWS_DEFAULT_REGION=$\{AWS_REGION\}\
+ExecStart=/usr/bin/env python3 /home/$\{USER_NAME\}/Documents/adsb/app/uploader.py\
+Restart=always\
+RestartSec=1\
+StandardOutput=append:/home/$\{USER_NAME\}/Documents/adsb/logs/uploader.log\
+StandardError=append:/home/$\{USER_NAME\}/Documents/adsb/logs/uploader.err\
+NoNewPrivileges=true\
+\
+[Install]\
+WantedBy=multi-user.target\
+EOF\
+\
+sudo systemctl daemon-reload\
+sudo systemctl enable dump1090-fa adsb-collector.service adsb-uploader.service\
+sudo systemctl restart dump1090-fa adsb-collector.service adsb-uploader.service\
+\
+### ===== Quick ADS-B sanity =====\
+echo "== Ports =="\
+sudo ss -lntp | egrep ':30002|:30003|:30005' || true\
+echo "== AVR sample (2s) =="\
+timeout 2s nc 127.0.0.1 30002 | head || true\
+echo "== Services =="\
+systemctl --no-pager --type=service --state=running | egrep 'dump1090-fa|adsb-(collector|uploader)' || true\
+echo "== Logs (last 20) =="\
+tail -n 20 "$\{LOG_DIR\}/collector.log" 2>/dev/null || true\
+tail -n 20 "$\{LOG_DIR\}/uploader.log"  2>/dev/null || true}
