@@ -1,2 +1,7 @@
 
 .DS_Store
+
+# never commit secrets or local notes
+aws_config.rtf
+CODE-BLOCK_SETUP_PI5_v3.rtf
+*.rtf
