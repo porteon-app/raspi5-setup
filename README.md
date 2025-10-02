@@ -3,6 +3,11 @@ Description of the setup of a new raspberry:
 
 You got it. Here’s a clean, repeatable way to get setup_adsb_v1-2.sh onto a fresh Pi 5 and run it.
 
+First install the file setup_adsb_vn-n.sh
+On the computer open a new shell and paste:
+scp setup_adsb_v1-2.sh pi@lsgs.local:/home/pi/
+[make sure you are connected with only one pi]
+
 ⸻
 
 A) Copy the script to the Pi (pick one)
