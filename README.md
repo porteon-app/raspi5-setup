@@ -10,89 +10,36 @@ scp setup_adsb_v1-2.sh pi@lsgs.local:/home/pi/
 
 ⸻
 
-A) Copy the script to the Pi (pick one)
+You’re hitting Permission denied (publickey) because you’re trying to copy as pi@ to /home/pi/, but this device is set up to use the lsgs user. There’s no matching key for pi, and password auth may be off—so the server rejects you before prompting.
 
-Option 1 — From your Mac via hotspot/LAN (recommended)
-	1.	Find the Pi’s IP (iPhone hotspot is usually 172.20.10.x; Android often 192.168.43.x).
-	2.	From your Mac:
+Do this:
 
-# adjust the source path if your script lives elsewhere
-scp /Users/frederic/Downloads/setup_adsb_v1-2.sh lsgs@<pi-ip>:~
+1) Use the correct user (and your key)
 
-Option 2 — With keyboard/HDMI & USB drive
-	•	Put setup_adsb_v1-2.sh on a USB stick.
-	•	Plug into the Pi, then on the Pi:
+scp -i ~/.ssh/id_ed25519 setup_adsb_v1-2.sh lsgs@lsgs-02.local:~
 
-cp /media/$USER/*/setup_adsb_v1-2.sh ~/
+Then on the Pi:
 
-Option 3 — Before first boot (for next time)
-	•	Mount the SD card’s boot partition on your Mac and drop the script there.
-	•	After first boot on the Pi:
-
-sudo cp /boot/setup_adsb_v1-2.sh ~/
-sudo chown lsgs:lsgs ~/setup_adsb_v1-2.sh
-
-
-⸻
-
-B) Run the installer on the Pi
-	1.	SSH into the Pi (or use the local terminal):
-
-ssh lsgs@<pi-ip>
-
-	2.	Make it executable and run with sudo:
-
+ssh -i ~/.ssh/id_ed25519 lsgs@lsgs-02.local
 chmod +x ~/setup_adsb_v1-2.sh
-sudo /home/lsgs/setup_adsb_v1-2.sh
+sudo ~/setup_adsb_v1-2.sh
 
-	3.	The script will prompt you for:
+2) If .local doesn’t resolve, use the hotspot IP
 
-	•	Hostname, timezone
-	•	Wi-Fi SSID/PSK (primary)
-	•	Sixfab APN (super by default) and optional SIM PIN
-	•	AWS: Access key, Secret key, Region (us-east-2), S3 prefix
-	•	Optional: remote.it R3 registration code
-	•	Optional: Tailscale auth key + tags
-	•	Optional: your SSH public key (so key-based SSH works right away)
+scp -i ~/.ssh/id_ed25519 setup_adsb_v1-2.sh lsgs@172.20.10.X:~
+ssh -i ~/.ssh/id_ed25519 lsgs@172.20.10.X
 
-Let it run to completion. If it asks to install packages, say yes.
+3) If you must use the pi account (not recommended here)
 
-⸻
+Enable/allow password auth (if permitted) and add your key:
 
-C) Reboot & verify
+ssh -o PubkeyAuthentication=no pi@lsgs-02.local    # login with the pi password
+ssh-copy-id -i ~/.ssh/id_ed25519.pub pi@lsgs-02.local
 
-sudo reboot
+…but since your services and paths are under /home/lsgs, stick with lsgs to keep everything consistent.
 
-After ~1–2 minutes, reconnect (hotspot/LAN or Tailscale/remote.it) and check:
+If it still denies, run a verbose attempt to see which key is offered:
 
-# services
-systemctl status dump1090-fa adsb-collector adsb-uploader --no-pager
-systemctl status adsb-online-bootstrap.timer --no-pager
+ssh -vv lsgs@lsgs-02.local
 
-# network: Wi-Fi preferred; LTE fallback if Wi-Fi is absent
-ip route | head -n 3
-nmcli -p con show lte | egrep 'autoconnect|gsm\.apn|route-metric' || true
-
-# uploader heartbeat + S3 flow
-tail -n 40 ~/Documents/adsb/logs/uploader.log
-aws s3 ls s3://adsbcsvdata/adsb_hex_data/Europe/switzerland/lsgs/ --region us-east-2 | tail
-
-You should see:
-	•	Active: active (running) for the three ADS-B services.
-	•	Default route via wlan0 if Wi-Fi is present; wwan (lte) if not.
-	•	“BOOTSTRAP tick” in uploader.log (hourly/boot watchdog).
-	•	New .hex.gz arriving in S3.
-
-⸻
-
-Tips / gotchas
-	•	If scp from the Mac says “No such file”, double-check the local path to the script.
-	•	If SSH to <pi-ip> fails, try ssh lsgs@lsgs-01.local (mDNS may or may not work on hotspots).
-	•	If you need to re-run the script later, just repeat:
-
-sudo /home/lsgs/setup_adsb_v1-2.sh
-
-
-	•	Keep your AWS keys, Wi-Fi SSID/PSK, Tailscale key, and remote.it code handy before you start; it makes the run smooth.
-
-If you want, I can also give you a one-liner variant (Pi pulls the script with curl and runs it), to avoid using scp at all.
+and paste the last ~20 lines if you want me to pinpoint it.
