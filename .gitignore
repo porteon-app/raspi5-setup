@@ -5,3 +5,13 @@
 aws_config.rtf
 CODE-BLOCK_SETUP_PI5_v3.rtf
 *.rtf
+readme
+README.md
+adsb-edge.env
+
+adsb-edge.env
+*.env
+.env*
+adsb-edge.env
+*.env
+.env*
