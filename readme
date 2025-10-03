@@ -12,7 +12,7 @@ scp -i ~/.ssh/id_ed25519 /Users/frederic/Downloads/setup_adsb.sh lsgs@lsgs-01.lo
 
 Then SSH to the Pi and run it:
 
-ssh -i ~/.ssh/id_ed25519 lsgs@lsgs-01.local
+ssh -i ~/.ssh/id_ed25519 lsgs@lsgs-02.local
 chmod +x ~/setup_adsb.sh
 sudo ~/setup_adsb.sh
 

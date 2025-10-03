@@ -8,7 +8,21 @@ set -euo pipefail
 log(){ printf "\e[1;36m>>> %s\e[0m\n" "$*"; }
 warn(){ printf "\e[1;33m⚠ %s\e[0m\n" "$*"; }
 ok(){ printf "\e[1;32m✔ %s\e[0m\n" "$*"; }
+
 ts(){ date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+# --- pre-load env (optional fleet config) ---
+# Prefer /etc/default/adsb-edge, else try boot partition variants
+for _env in /etc/default/adsb-edge /boot/adsb-edge.env /boot/firmware/adsb-edge.env; do
+  if [ -f "${_env}" ]; then
+    set +u
+    . "${_env}"
+    set -u
+    ENV_FILE="${_env}"
+    break
+  fi
+done
+: "${ENV_FILE:=/etc/default/adsb-edge}"
 
 export DEBIAN_FRONTEND=noninteractive
 # --- network + apt helpers (with retries, safe under set -e) ---
@@ -19,17 +33,21 @@ probe_net() {
 }
 
 apt_dns_repair() {
-  # Ensure systemd-resolved is active & resolv.conf points to stub
-  sudo systemctl enable --now systemd-resolved || true
-  sudo ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf || true
-
-  # Set DNS on connected *network* links only (if nmcli is present) and flush cache
-  if command -v nmcli >/dev/null 2>&1; then
-    for IF in $(nmcli -t -f DEVICE,TYPE,STATE dev status | awk -F: '($3 ~ /^connected/ && ($2=="wifi" || $2=="ethernet" || $2=="wwan")){print $1}'); do
-      sudo resolvectl dns "$IF" 1.1.1.1 8.8.8.8 || true
-    done
+  # Prefer systemd-resolved if present and startable; otherwise write static resolv.conf
+  if systemctl list-unit-files --type=service 2>/dev/null | grep -q '^systemd-resolved.service'; then
+    sudo systemctl enable --now systemd-resolved || true
+    sleep 1
+    if systemctl is-active --quiet systemd-resolved; then
+      sudo ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf || true
+    else
+      warn "systemd-resolved failed to start; falling back to static /etc/resolv.conf"
+      sudo rm -f /etc/resolv.conf
+      printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" | sudo tee /etc/resolv.conf >/dev/null
+    fi
+  else
+    sudo rm -f /etc/resolv.conf
+    printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" | sudo tee /etc/resolv.conf >/dev/null
   fi
-  sudo resolvectl flush-caches || true
 }
 
 apt_update_safe() {
@@ -54,21 +72,32 @@ apt_retry_install() {
     fi
     warn "apt install failed (attempt ${i}/${tries}); repairing DNS + nudging LTE, then retrying..."
     # Only bring LTE up if not already active (avoid flapping)
-    nmcli -t -f NAME con show --active 2>/dev/null | grep -qx lte || nmcli con up lte >/dev/null 2>&1 || true
+    nmcli -t -f NAME con show --active 2>/dev/null | grep -qx lte || sudo nmcli con up lte >/dev/null 2>&1 || true
     sleep $((4*i))
   done
   return 1
 }
 
-# Warn if sources codename mismatches OS (heads-up only)
+# Auto-repair sources.list if 'trixie' present but OS is not 'trixie'
 detect_sources_mismatch() {
   local os_codename=""
   if [ -f /etc/os-release ]; then
     . /etc/os-release
     os_codename="${VERSION_CODENAME:-}"
   fi
-  if grep -Rqs "trixie" /etc/apt/sources.list* && [ "${os_codename}" = "bookworm" ]; then
-    warn "APT sources target 'trixie' but OS codename is 'bookworm' — this can cause issues on Raspberry Pi OS."
+  [ -n "$os_codename" ] || return 0
+
+  # If any sources reference 'trixie' but OS isn't 'trixie', rewrite to the OS codename (with backups)
+  if grep -RqsE '(^|[[:space:]/])trixie([[:space:]/]|$)' /etc/apt/sources.list*; then
+    if [ "${os_codename}" != "trixie" ]; then
+      warn "APT sources mention 'trixie' but OS is '${os_codename}' — rewriting sources (backups kept)."
+      for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+        [ -e "$f" ] || continue
+        sudo cp -a "$f" "$f.bak.$(date +%s)" || true
+        sudo sed -i -E "s@(^|[[:space:]/])trixie([[:space:]/]|$)@\1${os_codename}\2@g" "$f" || true
+      done
+      ok "APT sources now point to '${os_codename}'."
+    fi
   fi
 }
 
@@ -77,10 +106,15 @@ PI_USER="${SUDO_USER:-$USER}"
 PI_HOME="$(getent passwd "$PI_USER" | cut -d: -f6)"
 HOSTNAME_DEF="$(hostname)"
 TZ_DEF="Europe/Zurich"
+WIFI_SSID=""
+WIFI_PSK=""
 AWS_REGION_DEF="us-east-2"
 S3_PREFIX_DEF="s3://adsbcsvdata/adsb_hex_data/Europe/switzerland/lsgs/"
 SIXFAB_APN_DEFAULT="super"  # Sixfab SIM APN
 DUMP1090_REF_DEF="master"
+AWS_ACCESS_KEY_ID=""
+AWS_SECRET_ACCESS_KEY=""
+SSH_PUBKEY=""
 
 # ---- prompts ----
 echo "=== ADS-B Edge Device One-Shot Installer (LTE failover ready) ==="
@@ -91,8 +125,10 @@ read -rp "Timezone (e.g. Europe/Zurich) [${TZ_DEF}]: " TZ_SET
 TZ_SET="${TZ_SET:-$TZ_DEF}"
 
 echo "---- Wi-Fi (primary) ----"
-read -rp "Wi-Fi SSID: " WIFI_SSID
-read -rsp "Wi-Fi password (leave empty if not needed): " WIFI_PSK; echo
+read -rp "Wi-Fi SSID [${WIFI_SSID}]: " WIFI_SSID
+WIFI_SSID="${WIFI_SSID:-$WIFI_SSID}"
+read -rsp "Wi-Fi password [${WIFI_PSK}]: " WIFI_PSK
+WIFI_PSK="${WIFI_PSK:-$WIFI_PSK}"
 
 echo "---- LTE (fallback via Sixfab SIM) ----"
 read -rp "Sixfab APN [${SIXFAB_APN_DEFAULT}]: " SIXFAB_APN
@@ -102,8 +138,10 @@ read -rp "SIM PIN (leave empty if none): " SIXFAB_PIN
 echo "---- AWS (S3 upload target) ----"
 read -rp "AWS Region [${AWS_REGION_DEF}]: " AWS_REGION
 AWS_REGION="${AWS_REGION:-$AWS_REGION_DEF}"
-read -rp "AWS Access Key ID: " AWS_ACCESS_KEY_ID
-read -rsp "AWS Secret Access Key: " AWS_SECRET_ACCESS_KEY; echo
+read -rp "AWS Access Key ID [${AWS_ACCESS_KEY_ID}]: " _AKI
+AWS_ACCESS_KEY_ID="${_AKI:-$AWS_ACCESS_KEY_ID}"
+read -rsp "AWS Secret Access Key [${AWS_SECRET_ACCESS_KEY}]: " _ASK; echo
+AWS_SECRET_ACCESS_KEY="${_ASK:-$AWS_SECRET_ACCESS_KEY}"
 read -rp "S3 prefix (s3://bucket/prefix/) [${S3_PREFIX_DEF}]: " S3_PREFIX
 S3_PREFIX="${S3_PREFIX:-$S3_PREFIX_DEF}"
 # normalize S3 prefix to end with a single '/'
@@ -119,25 +157,55 @@ echo "---- dump1090 build ----"
 read -rp "dump1090 git ref (branch/tag/SHA) [${DUMP1090_REF_DEF}]: " DUMP1090_REF
 DUMP1090_REF="${DUMP1090_REF:-$DUMP1090_REF_DEF}"
 
-# --- SSH key installation (for user $PI_USER) ---
-echo "---- SSH public key for ${PI_USER} (for SSH/remote.it) ----"
-read -rp "Paste your SSH PUBLIC key (ssh-ed25519/ssh-rsa). Leave empty to skip: " SSH_PUBKEY || true
 
-if [ -n "${SSH_PUBKEY:-}" ]; then
-  if echo "$SSH_PUBKEY" | grep -qE '^(ssh-ed25519|ssh-rsa)\s'; then
-    SSH_DIR="$PI_HOME/.ssh"
-    AUTH_KEYS="$SSH_DIR/authorized_keys"
-    mkdir -p "$SSH_DIR"
-    touch "$AUTH_KEYS"
-    if ! grep -qxF "$SSH_PUBKEY" "$AUTH_KEYS" 2>/dev/null; then
-      echo "$SSH_PUBKEY" >> "$AUTH_KEYS"
-      echo "Added key to $AUTH_KEYS"
+# --- SSH public key (env-aware; persisted) ---
+: "${ENV_FILE:=/etc/default/adsb-edge}"
+
+# Helper: sanitize the key (strip quotes, trim, squash spaces)
+_normalize_pubkey() {
+  # remove CRs, trim, collapse internal whitespace to single spaces
+  tr -d '\r' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/ /g'
+}
+
+# Ensure SSH_PUBKEY present (prompt only if missing)
+if [ -z "${SSH_PUBKEY:-}" ]; then
+  echo "---- SSH public key for ${PI_USER} (for SSH/remote.it) ----"
+  read -rp "SSH PUBLIC key (ssh-ed25519/ssh-rsa). Leave empty to skip: " SSH_PUBKEY || true
+  SSH_PUBKEY="$(printf '%s' "${SSH_PUBKEY:-}" | _normalize_pubkey)"
+  if [ -n "${SSH_PUBKEY}" ]; then
+    # Persist to env (quote safely)
+    if grep -q '^SSH_PUBKEY=' "${ENV_FILE}" 2>/dev/null; then
+      sudo sed -i -E "s|^SSH_PUBKEY=.*|SSH_PUBKEY='${SSH_PUBKEY//\'/\'\\\'\'}'|" "${ENV_FILE}"
     else
-      echo "Key already present in $AUTH_KEYS"
+      echo "SSH_PUBKEY='${SSH_PUBKEY//\'/\'\\\'\'}'" | sudo tee -a "${ENV_FILE}" >/dev/null
     fi
-    chown -R "$PI_USER":"$PI_USER" "$SSH_DIR"
-    chmod 700 "$SSH_DIR"
-    chmod 600 "$AUTH_KEYS"
+    sudo chmod 600 "${ENV_FILE}"
+  fi
+else
+  # Sanitize the env-provided key
+  SSH_PUBKEY="$(printf '%s' "${SSH_PUBKEY}" | _normalize_pubkey)"
+  echo "---- SSH public key: (from env) ----"
+fi
+
+# Validate + install
+if [ -n "${SSH_PUBKEY:-}" ]; then
+  # Accept common formats; do not over-validate the comment field
+  if printf '%s' "${SSH_PUBKEY}" | grep -qE '^(ssh-ed25519|ssh-rsa) [A-Za-z0-9+/=]+'; then
+    SSH_DIR="${PI_HOME}/.ssh"
+    AUTH_KEYS="${SSH_DIR}/authorized_keys"
+    mkdir -p "${SSH_DIR}"
+    touch "${AUTH_KEYS}"
+
+    if ! grep -qxF "${SSH_PUBKEY}" "${AUTH_KEYS}" 2>/dev/null; then
+      printf '%s\n' "${SSH_PUBKEY}" >> "${AUTH_KEYS}"
+      echo "Added key to ${AUTH_KEYS}"
+    else
+      echo "Key already present in ${AUTH_KEYS}"
+    fi
+
+    chown -R "${PI_USER}:${PI_USER}" "${SSH_DIR}"
+    chmod 700 "${SSH_DIR}"
+    chmod 600 "${AUTH_KEYS}"
 
     sudo mkdir -p /etc/ssh/sshd_config.d
     sudo tee /etc/ssh/sshd_config.d/10-adsb-ssh.conf >/dev/null <<'EOF'
@@ -147,12 +215,12 @@ PasswordAuthentication yes
 # Make sure standard locations are honored
 AuthorizedKeysFile .ssh/authorized_keys
 EOF
-    sudo systemctl reload ssh || sudo systemctl restart ssh
+    sudo systemctl reload ssh || sudo systemctl restart ssh || true
   else
-    echo "Public key format didn’t look right; skipping install."
+    warn "SSH_PUBKEY present but format looks invalid; expected 'ssh-ed25519 <base64> [comment]' or 'ssh-rsa <base64> [comment]'."
   fi
 else
-  echo "No public key provided; skipping."
+  echo "No SSH public key provided; skipping."
 fi
 
 # ---- layout ----
@@ -162,13 +230,14 @@ PROC_DIR="$BASE_DIR/files/processing"
 SEND_DIR="$BASE_DIR/files/sending"
 LOG_DIR="$BASE_DIR/logs"
 mkdir -p "$APP_DIR" "$PROC_DIR" "$SEND_DIR" "$LOG_DIR"
+chown -R "$PI_USER":"$PI_USER" "$BASE_DIR"
 
 # --- Create Python apps early (idempotent) ---
 cd "$APP_DIR"
 if [ ! -f collector.py ]; then
 cat > collector.py <<'PY'
 #!/usr/bin/env python3
-import os, socket, time, gzip, pathlib
+import os, socket, time, gzip, pathlib, signal, sys
 from datetime import datetime, timezone
 BASE=os.path.expanduser("~/Documents/adsb")
 PROC=os.path.join(BASE,"files","processing")
@@ -179,28 +248,41 @@ MAX_LINES=5000; MAX_SECS=3.0
 pathlib.Path(PROC).mkdir(parents=True, exist_ok=True)
 pathlib.Path(SEND).mkdir(parents=True, exist_ok=True)
 pathlib.Path(os.path.dirname(LOG)).mkdir(parents=True, exist_ok=True)
+
 def tsu(): return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-def rotate(buf, start_ns, hostname):
+
+def rotate(buf, hostname):
     if not buf: return
-    epoch_ms=int(start_ns/1_000_000)
+    epoch_ms=int(time.time()*1000)
     fname=f"hex_{hostname}_{time.strftime('%Y%m%d', time.gmtime())}_{epoch_ms}.hex"
     fpath=os.path.join(PROC,fname)
     with open(fpath,"w") as f: f.write("\n".join(buf)+"\n")
     gz=fpath+".gz"
     with open(fpath,"rb") as src, gzip.open(gz,"wb") as dst: dst.writelines(src)
-    os.remove(fpath); os.rename(gz, os.path.join(SEND, os.path.basename(gz)))
+    os.remove(fpath); os.replace(gz, os.path.join(SEND, os.path.basename(gz)))
+
 hostname=os.uname().nodename
+running=True
+
+def handle_term(signum, frame):
+    global running
+    running=False
+
+signal.signal(signal.SIGTERM, handle_term)
+signal.signal(signal.SIGINT, handle_term)
+
 with open(LOG,"a") as lg:
     lg.write(f"{tsu()} collector started\n"); lg.flush()
-    while True:
+    while running:
         try:
             with socket.create_connection((HOST,PORT),timeout=5) as s:
                 s.settimeout(0.2)
-                buf=[]; start=time.monotonic_ns()
-                while True:
+                buf=[]; start=time.monotonic()
+                while running:
                     try:
                         line=s.recv(65536)
-                        if not line: time.sleep(0.01); continue
+                        if not line:
+                            time.sleep(0.01); continue
                         for raw in line.splitlines():
                             if not raw: continue
                             txt=raw.decode('ascii','ignore')
@@ -209,9 +291,9 @@ with open(LOG,"a") as lg:
                             buf.append(f"{hexv} {tsu()}")
                     except socket.timeout:
                         pass
-                    now=time.monotonic_ns()
-                    if len(buf)>=MAX_LINES or (now-start)/1e9>=MAX_SECS:
-                        rotate(buf,start,hostname); buf=[]; start=now
+                    now=time.monotonic()
+                    if len(buf)>=MAX_LINES or (now-start)>=MAX_SECS:
+                        rotate(buf,hostname); buf=[]; start=now
         except Exception as e:
             with open(LOG,"a") as lg2: lg2.write(f"{tsu()} retry: {e}\n"); lg2.flush()
             time.sleep(2)
@@ -229,12 +311,18 @@ SEND=os.path.join(BASE,"files","sending")
 LOG=os.path.join(BASE,"logs","uploader.log")
 pathlib.Path(SEND).mkdir(parents=True, exist_ok=True)
 pathlib.Path(os.path.dirname(LOG)).mkdir(parents=True, exist_ok=True)
+
 def tsu(): return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 S3_PREFIX=os.environ.get("S3_PREFIX","s3://adsbcsvdata/adsb_hex_data/Europe/switzerland/lsgs/")
-REGION=os.environ.get("AWS_DEFAULT_REGION","us-east-2")
+REGION = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-2"))
+
 with open(LOG,"a") as lg: lg.write(f"{tsu()} uploader started\n"); lg.flush()
 while True:
-    files=sorted([f for f in os.listdir(SEND) if f.endswith(".hex.gz")])
+    try:
+        files=sorted([f for f in os.listdir(SEND) if f.endswith(".hex.gz")])
+    except FileNotFoundError:
+        time.sleep(1); continue
     for name in files:
         path=os.path.join(SEND,name)
         cmd=["aws","s3","cp",path,S3_PREFIX+name,"--region",REGION,"--only-show-errors"]
@@ -250,10 +338,11 @@ PY
 chmod +x uploader.py; chown "$PI_USER":"$PI_USER" uploader.py
 fi
 
-# DNS safety net if systemd-resolved not active yet
+# DNS safety net (works even if /etc/resolv.conf is a broken symlink)
 if ! systemctl is-active --quiet systemd-resolved; then
   warn "systemd-resolved not active; using temporary resolv.conf"
-  sudo bash -c 'printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf'
+  sudo rm -f /etc/resolv.conf
+  printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" | sudo tee /etc/resolv.conf >/dev/null
 fi
 
 # 1) Base packages, hostname, timezone, DNS cache, NM, ModemManager
@@ -308,7 +397,7 @@ if [ -n "${WIFI_SSID:-}" ]; then
     sudo nmcli con modify "$WIFI_CON_NAME" wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$WIFI_PSK" || true
   else
     # Open network (no key management)
-    sudo nmcli con modify "$WIFI_CON_NAME" -d wifi-sec.psk || true
+    sudo nmcli con modify "$WIFI_CON_NAME" --delete wifi-sec.psk || true
     sudo nmcli con modify "$WIFI_CON_NAME" wifi-sec.key-mgmt none || true
   fi
   sudo nmcli con modify "$WIFI_CON_NAME" connection.autoconnect yes ipv4.method auto ipv6.method ignore || true
@@ -334,9 +423,10 @@ chmod 600 "$AWS_CFG_DIR/credentials" "$AWS_CFG_DIR/config" || true
 # 4) Build & install dump1090-fa (with deps)
 log "Installing build deps & compiling dump1090-fa"
 log "Checking internet reachability before build deps"
+detect_sources_mismatch
 if ! probe_net; then
   warn "No internet yet; attempting to bring up LTE profile"
-  nmcli -t -f NAME con show --active 2>/dev/null | grep -qx lte || nmcli con up lte >/dev/null 2>&1 || true
+  nmcli -t -f NAME con show --active 2>/dev/null | grep -qx lte || sudo nmcli con up lte >/dev/null 2>&1 || true
   sleep 6
 fi
 apt_retry_install build-essential pkg-config libncurses-dev librtlsdr-dev libusb-1.0-0-dev git
@@ -403,10 +493,9 @@ WorkingDirectory=${APP_DIR}
 ExecStartPre=/bin/sh -c 'for i in \$(seq 1 30); do /usr/bin/ss -lnt | grep -q ":30002" && exit 0; sleep 1; done; exit 0'
 # Ensure the script exists and is executable
 ExecStartPre=/bin/sh -c '[ -x "${APP_DIR}/collector.py" ]'
-ExecStart=${APP_DIR}/collector.py
+ExecStart=/usr/bin/python3 ${APP_DIR}/collector.py
 Restart=always
 RestartSec=2
-StartLimitIntervalSec=0
 
 # Minimal hardening (portable)
 NoNewPrivileges=yes
@@ -425,11 +514,10 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=${PI_USER}
-Environment=S3_PREFIX=${S3_PREFIX}
-Environment=AWS_DEFAULT_REGION=${AWS_REGION}
+EnvironmentFile=-/etc/default/adsb-edge
 WorkingDirectory=${APP_DIR}
 ExecStartPre=/bin/sh -c '[ -x "${APP_DIR}/uploader.py" ]'
-ExecStart=${APP_DIR}/uploader.py
+ExecStart=/usr/bin/python3 ${APP_DIR}/uploader.py
 Restart=always
 RestartSec=5
 StartLimitIntervalSec=0
@@ -448,22 +536,41 @@ sudo tee /usr/local/sbin/adsb-health.sh >/dev/null <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 LOG="/var/log/adsb-health.log"
-ts(){ date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+_ts(){ printf "%s" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"; }
+
+# Choose the correct adsb base dir: prefer PI_HOME if provided; otherwise infer from adsb-uploader.service user
+_get_base(){
+  if [ -n "${PI_HOME:-}" ]; then
+    printf "%s" "${PI_HOME}/Documents/adsb"; return
+  fi
+  local u h
+  u="$(systemctl show -p User --value adsb-uploader.service 2>/dev/null || echo root)"
+  h="$(getent passwd "$u" | cut -d: -f6)"
+  printf "%s" "${h:-$HOME}/Documents/adsb"
+}
+BASE="$(_get_base)"
+SEND="${BASE}/files/sending"
+
 # DNS self-heal
 if ! systemctl is-active --quiet systemd-resolved; then
+  sudo rm -f /etc/resolv.conf
   printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" | sudo tee /etc/resolv.conf >/dev/null
 fi
+
 # dump1090 up?
 if ! ss -lnt | grep -q ':30002'; then
   systemctl restart dump1090-fa || true
 fi
-# uploader nudge if backlog
-BASE="${HOME}/Documents/adsb"
-SEND="${BASE}/files/sending"
-S=$(ls -1 "${SEND}"/*.gz 2>/dev/null | wc -l || echo 0)
+
+# uploader nudge if backlog (avoid 'ls' with pipefail)
+shopt -s nullglob
+files=("${SEND}"/*.gz)
+S=${#files[@]}
 if [ "${S:-0}" -gt 0 ] && ! systemctl is-active --quiet adsb-uploader; then
   systemctl restart adsb-uploader || true
 fi
+
+printf "%s BACKLOG=%s BASE=%s\n" "$(_ts)" "${S:-0}" "$BASE" >> "$LOG"
 EOF
 sudo chmod +x /usr/local/sbin/adsb-health.sh
 sudo tee /etc/systemd/system/adsb-health.timer >/dev/null <<'EOF'
@@ -480,6 +587,7 @@ sudo tee /etc/systemd/system/adsb-health.service >/dev/null <<'EOF'
 Description=ADS-B health run
 [Service]
 Type=oneshot
+EnvironmentFile=-/etc/default/adsb-edge
 ExecStart=/usr/local/sbin/adsb-health.sh
 # Minimal hardening
 NoNewPrivileges=yes
@@ -561,13 +669,13 @@ sudo tee /usr/local/sbin/net-failover.sh >/dev/null <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 REGION="${AWS_REGION:-us-east-2}"
-probe(){ curl -sS --ipv4 --max-time 5 "https://s3.${REGION}.amazonaws.com/" >/dev/null; }
+_probe(){ curl -sS --ipv4 --max-time 5 "https://s3.${REGION}.amazonaws.com/" >/dev/null; }
 # Only bring LTE up if it's not already active
-if ! probe; then
+if ! _probe; then
   if ! nmcli -t -f NAME con show --active 2>/dev/null | grep -qx lte; then
     nmcli con up lte >/dev/null 2>&1 || true
     sleep 5
-    probe || nmcli con up lte >/dev/null 2>&1 || true
+    _probe || nmcli con up lte >/dev/null 2>&1 || true
   fi
 fi
 EOF
@@ -577,7 +685,7 @@ sudo tee /etc/systemd/system/net-failover.service >/dev/null <<'EOF'
 Description=Bring LTE up when internet is unreachable
 [Service]
 Type=oneshot
-Environment=AWS_REGION=${AWS_REGION}
+EnvironmentFile=-/etc/default/adsb-edge
 ExecStart=/usr/local/sbin/net-failover.sh
 # Minimal hardening
 NoNewPrivileges=yes
@@ -601,7 +709,13 @@ set +e
 sudo systemd-analyze verify \
   /etc/systemd/system/dump1090-fa.service \
   /etc/systemd/system/adsb-collector.service \
-  /etc/systemd/system/adsb-uploader.service
+  /etc/systemd/system/adsb-uploader.service \
+  /etc/systemd/system/adsb-health.service \
+  /etc/systemd/system/adsb-health.timer \
+  /etc/systemd/system/remoteit-health.service \
+  /etc/systemd/system/remoteit-health.timer \
+  /etc/systemd/system/net-failover.service \
+  /etc/systemd/system/net-failover.timer
 set -e
 
 log "Enabling services & timers"
@@ -619,12 +733,13 @@ echo "[INFO] Installing ADS-B online bootstrap (network+services watchdog)..."
 sudo tee /usr/local/sbin/adsb-online-bootstrap.sh >/dev/null <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-ts(){ date -u +"%Y-%m-%dT%H:%M:%SZ"; echo -n " "; }
-log(){ echo "$(ts)$*"; }
+_ts(){ printf "%s " "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"; }
+log(){ echo "$(_ts)$*"; }
 
 # DNS guard
 if ! systemctl is-active --quiet systemd-resolved; then
   log "[DNS] systemd-resolved down, writing temporary resolv.conf"
+  sudo rm -f /etc/resolv.conf
   printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" | sudo tee /etc/resolv.conf >/dev/null
 fi
 
@@ -633,15 +748,15 @@ systemctl start NetworkManager ModemManager || true
 
 # Internet probe
 REGION="${AWS_REGION:-us-east-2}"
-probe(){ curl -sS --ipv4 --max-time 5 "https://s3.${REGION}.amazonaws.com/" >/dev/null; }
-if ! probe; then
+_probe(){ curl -sS --ipv4 --max-time 5 "https://s3.${REGION}.amazonaws.com/" >/dev/null; }
+if ! _probe; then
   log "[NET] Internet not reachable, attempting LTE bring-up"
   nmcli -t -f NAME con show --active 2>/dev/null | grep -qx lte || nmcli con up lte >/dev/null 2>&1 || true
   sleep 8
 fi
 
 for i in $(seq 1 18); do
-  if probe; then
+  if _probe; then
     log "[NET] Internet reachable"
     break
   fi
@@ -661,9 +776,8 @@ sleep 3
 systemctl restart adsb-collector.service || true
 systemctl restart adsb-uploader.service  || true
 log "[ADSB] services restarted in order"
-/usr/local/sbin/adsb-restart-services.sh >/dev/null 2>&1 || true
 
-UPLOG="$HOME/Documents/adsb/logs/uploader.log"
+UPLOG="${PI_HOME:-$HOME}/Documents/adsb/logs/uploader.log"
 mkdir -p "$(dirname "$UPLOG")"
 echo "$(date -u +%FT%TZ) BOOTSTRAP tick" >> "$UPLOG"
 EOF
@@ -677,7 +791,7 @@ After=network-online.target NetworkManager.service ModemManager.service systemd-
 
 [Service]
 Type=oneshot
-Environment=AWS_REGION=${AWS_REGION}
+EnvironmentFile=-/etc/default/adsb-edge
 ExecStart=/usr/local/sbin/adsb-online-bootstrap.sh
 # Minimal hardening
 NoNewPrivileges=yes
@@ -701,6 +815,33 @@ EOF
 sudo systemctl daemon-reload
 sudo systemctl enable --now adsb-online-bootstrap.timer
 
+# 14) Logrotate setup
+log "Installing logrotate config for adsb-edge"
+sudo tee /etc/logrotate.d/adsb-edge >/dev/null <<EOF
+/var/log/adsb-health.log {
+    daily
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    create 0644 root root
+}
+
+${PI_HOME}/Documents/adsb/logs/*.log {
+    su ${PI_USER} ${PI_USER}
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    create 0640 ${PI_USER} ${PI_USER}
+}
+EOF
+
 # 13) Quick checks
 log "Quick checks"
 ss -lnt | grep -E -q ':30002|:30003|:30005' && ok "dump1090 ports up" || warn "dump1090 port 30002 not listening yet"
@@ -722,11 +863,12 @@ EOF
 
 # 10.5) Connectivity restore hooks (restart services on Wi-Fi/LTE back online)
 log "Installing connectivity-restore hooks"
+sudo mkdir -p /etc/NetworkManager/dispatcher.d
 sudo tee /usr/local/sbin/adsb-restart-services.sh >/dev/null <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-ts(){ date -u +"%Y-%m-%dT%H:%M:%SZ"; }
-log(){ printf "%s [ADSBRST] %s\n" "$(ts)" "$*"; }
+_ts(){ printf "%s" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"; }
+log(){ printf "%s [ADSBRST] %s\n" "$(_ts)" "$*"; }
 SERVICES=(dump1090-fa adsb-collector adsb-uploader)
 for s in "${SERVICES[@]}"; do
   systemctl restart "$s" || true
@@ -735,7 +877,6 @@ done
 EOF
 sudo chmod +x /usr/local/sbin/adsb-restart-services.sh
 
-sudo mkdir -p /etc/NetworkManager/dispatcher.d
 sudo tee /etc/NetworkManager/dispatcher.d/90-adsb-recover.sh >/dev/null <<'EOF'
 #!/usr/bin/env bash
 # Called by NetworkManager: $1 = interface, $2 = event

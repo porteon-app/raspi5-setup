@@ -9,8 +9,7 @@ log(){ printf "\e[1;36m>>> %s\e[0m\n" "$*"; }
 warn(){ printf "\e[1;33m⚠ %s\e[0m\n" "$*"; }
 ok(){ printf "\e[1;32m✔ %s\e[0m\n" "$*"; }
 ts(){ date -u +"%Y-%m-%dT%H:%M:%SZ"; }
-probe_net(){ curl -sS --ipv4 --max-time 5 https://s3.us-east-2.amazonaws.com/ >/dev/null; }
-try_or_warn(){ if ! bash -c "$*"; then warn "non-fatal: $*"; fi }
+
 # ---- defaults / env ----
 PI_USER="${SUDO_USER:-$USER}"
 PI_HOME="$(getent passwd "$PI_USER" | cut -d: -f6)"
@@ -133,45 +132,23 @@ sudo systemctl enable --now ModemManager
 if [ -n "${WIFI_SSID:-}" ]; then
   nmcli radio wifi on || true
   if [ -n "${WIFI_PSK:-}" ]; then
-    # WPA-PSK network
-    if nmcli -t -f NAME,TYPE con show | grep -q "^${WIFI_SSID}:wifi$"; then
-      sudo nmcli con modify "${WIFI_SSID}" wifi-sec.key-mgmt wpa-psk wifi-sec.psk "${WIFI_PSK}" connection.autoconnect yes || true
-    else
-      sudo nmcli con add type wifi ifname "*" con-name "${WIFI_SSID}" ssid "${WIFI_SSID}" || true
-      sudo nmcli con modify "${WIFI_SSID}" wifi-sec.key-mgmt wpa-psk wifi-sec.psk "${WIFI_PSK}" connection.autoconnect yes || true
-    fi
-    nmcli con up "${WIFI_SSID}" || true
+    nmcli dev wifi connect "$WIFI_SSID" password "$WIFI_PSK" || true
   else
-    # Open network (no PSK)
-    if ! nmcli -t -f NAME,TYPE con show | grep -q "^${WIFI_SSID}:wifi$"; then
-      sudo nmcli con add type wifi ifname "*" con-name "${WIFI_SSID}" ssid "${WIFI_SSID}" || true
-    fi
-    sudo nmcli con modify "${WIFI_SSID}" connection.autoconnect yes || true
-    nmcli con up "${WIFI_SSID}" || true
+    nmcli dev wifi connect "$WIFI_SSID" || true
   fi
 fi
 
-# 2) Tailscale install & bring up (resilient; non-fatal if DNS/Internet isn't ready yet)
-log "Ensuring Tailscale is installed & up (non-fatal if offline)"
+# 2) Tailscale install & bring up
+log "Ensuring Tailscale is installed & up"
 if ! dpkg -s tailscale >/dev/null 2>&1; then
-  if probe_net; then
-    if ! curl -fsSL https://tailscale.com/install.sh | sh; then
-      warn "Tailscale install failed (continuing setup)"
-    fi
-  else
-    warn "No internet yet; skipping Tailscale install for now"
-  fi
+  curl -fsSL https://tailscale.com/install.sh | sh
 fi
 sudo systemctl enable --now tailscaled || true
 if [ -n "${TS_AUTHKEY:-}" ]; then
-  if probe_net; then
-    if ! sudo tailscale up --authkey "${TS_AUTHKEY}" --ssh --accept-routes --accept-dns --advertise-tags="${TS_TAGS}"; then
-      warn "Tailscale up with tags failed; retrying without tags"
-      sudo tailscale up --reset || true
-      sudo tailscale up --authkey "${TS_AUTHKEY}" --ssh --accept-routes --accept-dns || true
-    fi
-  else
-    warn "No internet yet; will rely on bootstrap to bring Tailscale up later"
+  if ! sudo tailscale up --authkey "${TS_AUTHKEY}" --ssh --accept-routes --accept-dns --advertise-tags="${TS_TAGS}"; then
+    warn "Tailscale tags denied; retrying without tags"
+    sudo tailscale up --reset || true
+    sudo tailscale up --authkey "${TS_AUTHKEY}" --ssh --accept-routes --accept-dns || true
   fi
 fi
 
@@ -425,15 +402,8 @@ Description=remote.it health run
 Type=oneshot
 ExecStart=/usr/local/sbin/remoteit-health.sh
 EOF
-
 if [ -n "${REMOTEIT_R3:-}" ] && ! command -v remoteit >/dev/null 2>&1; then
-  if probe_net; then
-    if ! R3_REGISTRATION_CODE="${REMOTEIT_R3}" sh -c "$(curl -fsSL https://downloads.remote.it/remoteit/install_agent.sh)"; then
-      warn "remote.it install returned non-zero (continuing setup)"
-    fi
-  else
-    warn "No internet yet; skipping remote.it install (bootstrap will refresh later)"
-  fi
+  R3_REGISTRATION_CODE="${REMOTEIT_R3}" sh -c "$(curl -L https://downloads.remote.it/remoteit/install_agent.sh)" || warn "remote.it install returned non-zero"
 fi
 
 # 10) **LTE FAILOVER CORE** — create/manage GSM profile & failover timer
@@ -592,7 +562,7 @@ nmcli device || true
 ip route | head -n 5 || true
 
 cat <<EOF
-ok "[SETUP COMPLETE] Core services and files have been installed/configured (network add-ons will self-heal later)."
+
 Install finished. Recommended: sudo reboot
 After reboot:
   - Route should be via Wi-Fi when present, LTE otherwise (check: ip route | head -1)
